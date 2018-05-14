@@ -111,15 +111,8 @@ struct domain * domain_struct_from_dns_query(char * query)
 char * dns_query_from_domain_struct(struct domain * d)
 {
     int i, j;
-    int len = 0;
-    struct domain * enumerator = d;
-    while (enumerator != NULL)
-    {
-        len = len + enumerator->len + 1;
-        enumerator = enumerator->next;
-    }
 
-    char * query = malloc(len + 1);
+    char * query = malloc(query_len(d));
     i = 0;
     while (d != NULL)
     {
@@ -133,6 +126,18 @@ char * dns_query_from_domain_struct(struct domain * d)
     query[i+1] = '\0';
 
     return query;
+}
+
+int query_len(struct domain * d)
+{
+    int len = 0;
+    struct domain * enumerator = d;
+    while (enumerator != NULL)
+    {
+        len = len + enumerator->len + 1;
+        enumerator = enumerator->next;
+    }
+    return len + 1;
 }
 
 int compare_domain_structs(struct domain * d1, struct domain * d2)

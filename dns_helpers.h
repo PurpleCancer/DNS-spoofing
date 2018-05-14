@@ -15,6 +15,8 @@ struct dns_header_window
     unsigned short flags;
     unsigned short qs;
     unsigned short as;
+    unsigned short authrrs;
+    unsigned short addrrs;
 };
 
 struct dns_answer
@@ -35,5 +37,6 @@ void insert_at_end(struct domain * list, struct domain * el);
 struct domain * domain_struct_from_domain_name(char * name);
 struct domain * domain_struct_from_dns_query(char * query);
 char * dns_query_from_domain_struct(struct domain * d);
+int query_len(struct domain * d);
 
 int compare_domain_structs(struct domain * d1, struct domain * d2);
