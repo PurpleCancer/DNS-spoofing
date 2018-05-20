@@ -149,7 +149,19 @@ int compare_domain_structs(struct domain * d1, struct domain * d2)
 
         int c = strcmp(d1->content, d2->content);
         if (c != 0)
-            return c;
+		{
+			if (strcmp(d1->content, "www") == 0)
+			{
+				d1 = d1->next;
+				continue;
+			}
+			else if (strcmp(d2->content, "www") == 0)
+			{
+				d2 = d2->next;
+				continue;
+			}
+			return c;
+		}
 
         d1 = d1->next;
         d2 = d2->next;

